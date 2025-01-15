@@ -9,51 +9,7 @@ from gymnasium.wrappers import TimeLimit
 import os
 from env_hiv import HIVPatient
 
-# 1. History Wrapper with One-Hot Encoding and Safe Normalization
-class HistoryWrapper(gym.Wrapper):
-    """Wrapper to maintain history of observations and actions"""
-    def __init__(self, env, history_length=4):
-        super(HistoryWrapper, self).__init__(env)
-        self.history_length = history_length
-        self.state_history = deque(maxlen=history_length)
-        self.action_history = deque(maxlen=history_length)
-        
-        original_space = env.observation_space
-        self.action_dim = env.action_space.n
-        
-        # Calculate new observation space dimensions
-        # Assuming state_dim=6
-        new_low = np.concatenate([original_space.low for _ in range(history_length)] +
-                                 [np.zeros(self.action_dim) for _ in range(history_length)])
-        new_high = np.concatenate([original_space.high for _ in range(history_length)] +
-                                  [np.ones(self.action_dim) for _ in range(history_length)])
-        
-        self.observation_space = gym.spaces.Box(low=new_low, high=new_high, dtype=np.float32)
-    
-    def reset(self, **kwargs):
-        observation, info = self.env.reset(**kwargs)
-        for _ in range(self.history_length):
-            self.state_history.append(observation)
-            self.action_history.append(0)  # No-action placeholder
-        return self._get_observation(), info
-    
-    def step(self, action):
-        observation, reward, done, truncated, info = self.env.step(action)
-        self.state_history.append(observation)
-        self.action_history.append(action)
-        return self._get_observation(), reward, done, truncated, info
-    
-    def _get_observation(self):
-        state_history = np.concatenate(list(self.state_history))
-        action_history = np.array(list(self.action_history)).reshape(-1, 1)
-        # One-hot encode actions
-        one_hot_actions = np.eye(self.action_dim)[action_history].reshape(-1)
-        # Safe normalization: ensure no negative values for log1p
-        state_history = np.maximum(state_history, 0)
-        normalized_states = np.log1p(state_history)  # Log normalization
-        return np.concatenate([normalized_states, one_hot_actions]).astype(np.float32)
-
-# 2. Revised Dueling DQN Architecture
+# 1. Revised Dueling DQN Architecture without History
 class DuelingDQN(nn.Module):
     """Dueling DQN architecture with Double DQN implementation"""
     def __init__(self, state_dim, action_dim):
@@ -87,8 +43,7 @@ class DuelingDQN(nn.Module):
         advantage = self.advantage_net(features)
         return value + (advantage - advantage.mean(dim=1, keepdim=True))
 
-# 3. Revised Replay Buffer with Prioritized Experience Replay (Optional)
-# If you prefer to stick with the standard ReplayBuffer, you can omit this section.
+# 2. Standard Replay Buffer
 class ReplayBuffer:
     """Simple replay buffer"""
     def __init__(self, capacity=100000):
@@ -114,7 +69,7 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-# 4. Agent Class with Enhanced Training Stability
+# 3. Agent Class with Enhanced Training Stability
 class ProjectAgent:
     """DQN agent that interfaces with the HIV environment"""
     def __init__(self):
@@ -131,8 +86,7 @@ class ProjectAgent:
         print(f"Using device: {self.device}")
         
         # Network dimensions
-        history_length = 4
-        state_dim = (6 + 4) * history_length  # 6 state variables + 4 one-hot action dimensions, history_length=4
+        state_dim = 6  # Align with evaluation environment
         self.action_dim = 4  # HIV environment has 4 actions
         
         # Initialize networks
@@ -233,12 +187,12 @@ class ProjectAgent:
         else:
             print(f"No model found at {path}")
 
-# 5. Evaluation Function
+# 4. Evaluation Function (Unchanged)
 def evaluate_agent(agent, eval_env, num_episodes=5):
     """Evaluate the agent's performance"""
     eval_rewards = []
     
-    for _ in range(num_episodes):
+    for episode in range(num_episodes):
         eval_state, _ = eval_env.reset()
         eval_episode_reward = 0
         eval_done = False
@@ -253,19 +207,17 @@ def evaluate_agent(agent, eval_env, num_episodes=5):
     
     return sum(eval_rewards) / len(eval_rewards)
 
-# 6. Training Routine with Enhanced Logging
+# 5. Training Routine with Enhanced Logging
 def main():
-    # Create environments
+    # Create environments without HistoryWrapper
     base_env = HIVPatient(domain_randomization=False)
-    wrapped_env = HistoryWrapper(base_env, history_length=4)
-    env = TimeLimit(wrapped_env, max_episode_steps=200)
+    env = TimeLimit(base_env, max_episode_steps=200)
     
     eval_base_env = HIVPatient(domain_randomization=False)
-    eval_wrapped_env = HistoryWrapper(eval_base_env, history_length=4)
-    eval_env = TimeLimit(eval_wrapped_env, max_episode_steps=200)
+    eval_env = TimeLimit(eval_base_env, max_episode_steps=200)
     
     # Create agent
-    agent = Agent()
+    agent = ProjectAgent()
     
     # Training parameters
     num_episodes = 300
@@ -330,3 +282,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
