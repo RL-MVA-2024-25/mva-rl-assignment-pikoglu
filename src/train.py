@@ -9,7 +9,10 @@ from gymnasium.wrappers import TimeLimit
 import os
 from env_hiv import HIVPatient
 
-# 1. Revised Dueling DQN Architecture without History
+# Define a reward scaling factor
+REWARD_SCALE = 1e6
+
+# 1. Revised Dueling DQN Architecture with Soft Updates
 class DuelingDQN(nn.Module):
     """Dueling DQN architecture with Double DQN implementation"""
     def __init__(self, state_dim, action_dim):
@@ -75,11 +78,14 @@ class ProjectAgent:
     def __init__(self):
         # Training parameters
         self.gamma = 0.99
-        self.lr = 1e-4  # Reduced learning rate
+        self.lr = 1e-5  # Further reduced learning rate
         self.batch_size = 128
         self.epsilon = 1.0
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = 0.99  # Slower decay rate
+        
+        # Soft update parameter
+        self.tau = 0.001  # For soft target updates
         
         # Initialize device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,10 +109,15 @@ class ProjectAgent:
         
         # Initialize counters
         self.update_counter = 0
-        self.target_update_freq = 1000  # Update target network every 1000 steps
+        self.target_update_freq = 1000  # Not used with soft updates but kept for reference
         
         # Initialize loss function
         self.loss_fn = nn.SmoothL1Loss()  # Huber Loss
+    
+    def soft_update(self):
+        """Soft update model parameters."""
+        for target_param, param in zip(self.target_net.parameters(), self.q_net.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
     
     def act(self, state, use_random=False):
         """Select action using epsilon-greedy policy"""
@@ -126,6 +137,9 @@ class ProjectAgent:
         
         # Sample from replay buffer
         states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
+        
+        # Scale rewards
+        rewards = rewards / REWARD_SCALE
         
         # Convert to tensors
         states = torch.FloatTensor(states).to(self.device)
@@ -152,13 +166,11 @@ class ProjectAgent:
         self.optimizer.zero_grad()
         loss.backward()
         # Clip gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)  # Reduced from 10
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)  # Already 1.0
         self.optimizer.step()
         
-        # Update target network
-        self.update_counter += 1
-        if self.update_counter % self.target_update_freq == 0:
-            self.target_net.load_state_dict(self.q_net.state_dict())
+        # Soft update target network
+        self.soft_update()
         
         # Decay epsilon
         if self.epsilon > self.epsilon_min:
@@ -219,8 +231,11 @@ def main():
     # Create agent
     agent = ProjectAgent()
     
+    # Optionally load a pre-trained model
+    # agent.load("best_model.pt")
+    
     # Training parameters
-    num_episodes = 300
+    num_episodes = 300  # You can increase this number for better performance
     eval_freq = 10
     best_eval_reward = float('-inf')
     
@@ -240,7 +255,7 @@ def main():
                 action = agent.act(state, use_random=True)
                 next_state, reward, done, truncated, _ = env.step(action)
                 
-                # Store transition
+                # Store transition with scaled reward
                 agent.memory.push(state, action, reward, next_state, done or truncated)
                 
                 # Move to next state
@@ -271,7 +286,7 @@ def main():
                 # Save best model
                 if avg_eval_reward > best_eval_reward:
                     best_eval_reward = avg_eval_reward
-                    agent.save("best_model.pt")
+                    agent.save("dqn_model.pt")
                     print(f"New best model saved with reward: {best_eval_reward:.2f}")
     
     except KeyboardInterrupt:
