@@ -1,300 +1,307 @@
-import numpy as np
-import random
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from collections import deque
-import gymnasium as gym
 from gymnasium.wrappers import TimeLimit
-import os
 from env_hiv import HIVPatient
+import torch
+import tqdm 
+import random
+import numpy as np
+from copy import deepcopy
+import os
 
-# Define a reward scaling factor
-REWARD_SCALE = 1e6
+env = TimeLimit(
+    env=HIVPatient(domain_randomization=True), max_episode_steps=200
+)  
 
-# 1. Revised Dueling DQN Architecture with Soft Updates
-class DuelingDQN(nn.Module):
-    """Dueling DQN architecture with Double DQN implementation"""
-    def __init__(self, state_dim, action_dim):
-        super(DuelingDQN, self).__init__()
-        
-        # Feature extractor
-        self.feature_net = nn.Sequential(
-            nn.Linear(state_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU()
-        )
-        
-        # Value stream
-        self.value_net = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1)
-        )
-        
-        # Advantage stream
-        self.advantage_net = nn.Sequential(
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, action_dim)
-        )
-        
-    def forward(self, x):
-        features = self.feature_net(x)
-        value = self.value_net(features)
-        advantage = self.advantage_net(features)
-        return value + (advantage - advantage.mean(dim=1, keepdim=True))
-
-# 2. Standard Replay Buffer
 class ReplayBuffer:
-    """Simple replay buffer"""
-    def __init__(self, capacity=100000):
-        self.buffer = []
-        self.capacity = capacity
-        self.pos = 0
-        
-    def push(self, state, action, reward, next_state, done):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.pos] = (state, action, reward, next_state, done)
-        self.pos = (self.pos + 1) % self.capacity
-    
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        state, action, reward, next_state, done = zip(*batch)
-        return (np.array(state), 
-                np.array(action), 
-                np.array(reward, dtype=np.float32),
-                np.array(next_state),
-                np.array(done, dtype=np.float32))
-    
-    def __len__(self):
-        return len(self.buffer)
+    def __init__(self, capacity, device):
+        self.capacity = int(capacity) 
+        self.data = []
+        self.index = 0 
+        self.device = device
 
-# 3. Agent Class with Enhanced Training Stability
-class ProjectAgent:
-    """DQN agent that interfaces with the HIV environment"""
-    def __init__(self):
-        # Training parameters
-        self.gamma = 0.99
-        self.lr = 1e-5  # Further reduced learning rate
-        self.batch_size = 128
-        self.epsilon = 1.0
-        self.epsilon_min = 0.01
-        self.epsilon_decay = 0.99  # Slower decay rate
-        
-        # Soft update parameter
-        self.tau = 0.001  # For soft target updates
-        
-        # Initialize device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {self.device}")
-        
-        # Network dimensions
-        state_dim = 6  # Align with evaluation environment
-        self.action_dim = 4  # HIV environment has 4 actions
-        
-        # Initialize networks
-        self.q_net = DuelingDQN(state_dim, self.action_dim).to(self.device)
-        self.target_net = DuelingDQN(state_dim, self.action_dim).to(self.device)
-        self.target_net.load_state_dict(self.q_net.state_dict())
-        self.target_net.eval()
-        
-        # Initialize optimizer
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
-        
-        # Initialize replay buffer
-        self.memory = ReplayBuffer(capacity=100000)
-        
-        # Initialize counters
-        self.update_counter = 0
-        self.target_update_freq = 1000  # Not used with soft updates but kept for reference
-        
-        # Initialize loss function
-        self.loss_fn = nn.SmoothL1Loss()  # Huber Loss
+    def append(self, s, a, r, s_, d):
+        if len(self.data) < self.capacity:
+            self.data.append(None)
+        self.data[self.index] = (s, a, r, s_, d)
+        self.index = (self.index + 1) % self.capacity
+
+    def sample(self, batch_size):
+        batch = random.sample(self.data, batch_size)
+        return list(map(lambda x: torch.Tensor(np.array(x)).to(self.device), list(zip(*batch))))
+
+    def __len__(self):
+        return len(self.data)
+
+
+def greedy_action(network, state):
+    device = "cuda" if next(network.parameters()).is_cuda else "cpu"
+    with torch.no_grad():
+        Q = network(torch.Tensor(state).unsqueeze(0).to(device))
+        return torch.argmax(Q).item()
+
+
+class MLP(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, depth=2, activation=torch.nn.SiLU(), normalization=None):
+        super(MLP, self).__init__()
+        self.input_layer = torch.nn.Linear(input_dim, hidden_dim)
+        self.hidden_layers = torch.nn.ModuleList([torch.nn.Linear(hidden_dim, hidden_dim) for _ in range(depth - 1)])
+        self.output_layer = torch.nn.Linear(hidden_dim, output_dim)
+        if activation is not None:
+            self.activation = activation
+        else:
+            self.activation = torch.nn.ReLU()
+        if normalization == 'batch':
+            self.normalization = torch.nn.BatchNorm1d(hidden_dim)
+        elif normalization == 'layer':
+            self.normalization = torch.nn.LayerNorm(hidden_dim)
+        else:
+            self.normalization = None
+
+    def forward(self, x):
+        x = self.activation(self.input_layer(x))
+        for layer in self.hidden_layers:
+            x = self.activation(layer(x))
+            if self.normalization is not None:
+                x = self.normalization(x)
+        return self.output_layer(x)
+
+
+class DQN_Agent:
+    def __init__(self, config, model):
+        device = "cuda" if next(model.parameters()).is_cuda else "cpu"
+        self.device = device  # Added device attribute
+        self.nb_actions = config['nb_actions']
+        self.gamma = config['gamma'] if 'gamma' in config.keys() else 0.95
+        self.batch_size = config['batch_size'] if 'batch_size' in config.keys() else 100
+        buffer_size = config['buffer_size'] if 'buffer_size' in config.keys() else int(1e5)
+        self.memory = ReplayBuffer(buffer_size, device)
+        self.epsilon_max = config['epsilon_max'] if 'epsilon_max' in config.keys() else 1.
+        self.epsilon_min = config['epsilon_min'] if 'epsilon_min' in config.keys() else 0.01
+        self.epsilon_stop = config['epsilon_decay_period'] if 'epsilon_decay_period' in config.keys() else 1000
+        self.epsilon_delay = config['epsilon_delay_decay'] if 'epsilon_delay_decay' in config.keys() else 20
+        self.epsilon_step = (self.epsilon_max - self.epsilon_min) / self.epsilon_stop
+        self.model = model 
+        self.target_model = deepcopy(self.model).to(device)
+        self.target_model.eval()  
+        self.criterion = config['criterion'] if 'criterion' in config.keys() else torch.nn.MSELoss()
+        lr = config['learning_rate'] if 'learning_rate' in config.keys() else 0.001
+        self.optimizer = config['optimizer'] if 'optimizer' in config.keys() else torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.nb_gradient_steps = config['gradient_steps'] if 'gradient_steps' in config.keys() else 1
+        self.update_target_strategy = config['update_target_strategy'] if 'update_target_strategy' in config.keys() else 'replace'
+        self.update_target_freq = config['update_target_freq'] if 'update_target_freq' in config.keys() else 20
+        self.update_target_tau = config['update_target_tau'] if 'update_target_tau' in config.keys() else 0.005
+        self.monitoring_nb_trials = config['monitoring_nb_trials'] if 'monitoring_nb_trials' in config.keys() else 0
+        self.monitor_every = config['monitor_every'] if 'monitor_every' in config.keys() else 10
+        self.save_path = config['save_path'] if 'save_path' in config.keys() else './agent.pth'
+        self.save_every = config['save_every'] if 'save_every' in config.keys() else 100
+        self.learn_step_counter = 0  # Initialize learn step counter
+        self.best_return = 0  # Track best return
+
+    def MC_eval(self, env, nb_trials):
+        MC_total_reward = []
+        MC_discounted_reward = []
+        for _ in range(nb_trials):
+            x, _ = env.reset()
+            done = False
+            trunc = False
+            total_reward = 0
+            discounted_reward = 0
+            step = 0
+            while not (done or trunc):
+                a = greedy_action(self.model, x)
+                y, r, done, trunc, _ = env.step(a)
+                x = y
+                total_reward += r
+                discounted_reward += self.gamma ** step * r
+                step += 1
+            MC_total_reward.append(total_reward)
+            MC_discounted_reward.append(discounted_reward)
+        return np.mean(MC_discounted_reward), np.mean(MC_total_reward)
     
-    def soft_update(self):
-        """Soft update model parameters."""
-        for target_param, param in zip(self.target_net.parameters(), self.q_net.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
-    
-    def act(self, state, use_random=False):
-        """Select action using epsilon-greedy policy"""
-        if use_random and random.random() < self.epsilon:
-            return random.randint(0, self.action_dim - 1)
-        
+    def V_initial_state(self, env, nb_trials):
         with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
-            q_values = self.q_net(state_tensor)
-            action = q_values.argmax(dim=1).item()
-            return action
+            val = []
+            for _ in range(nb_trials):
+                x, _ = env.reset()
+                Q_values = self.model(torch.Tensor(x).unsqueeze(0).to(self.device)).max().item()
+                val.append(Q_values)
+        return np.mean(val)
     
-    def update(self):
-        """Perform one step of training"""
+    def gradient_step(self):
         if len(self.memory) < self.batch_size:
-            return
-        
-        # Sample from replay buffer
-        states, actions, rewards, next_states, dones = self.memory.sample(self.batch_size)
-        
-        # Scale rewards
-        rewards = rewards / REWARD_SCALE
-        
-        # Convert to tensors
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.LongTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).to(self.device)
-        
-        # Current Q values
-        current_q_values = self.q_net(states).gather(1, actions.unsqueeze(1))
-        
-        # Next Q values using Double DQN
-        with torch.no_grad():
-            # Action selection is from the current network
-            next_actions = self.q_net(next_states).argmax(dim=1, keepdim=True)
-            # Action evaluation is from the target network
-            next_q_values = self.target_net(next_states).gather(1, next_actions)
-            target_q_values = rewards.unsqueeze(1) + (1 - dones.unsqueeze(1)) * self.gamma * next_q_values
-        
-        # Compute loss using Huber Loss
-        loss = self.loss_fn(current_q_values, target_q_values)
-        
-        # Optimize the model
+            return  # Not enough samples to learn
+
+        X, A, R, Y, D = self.memory.sample(self.batch_size)
+        QYmax = self.target_model(Y).max(1)[0].detach()
+        update = torch.addcmul(R, 1 - D, QYmax, value=self.gamma)
+        QXA = self.model(X).gather(1, A.to(torch.long).unsqueeze(1))
+        loss = self.criterion(QXA, update.unsqueeze(1))
         self.optimizer.zero_grad()
         loss.backward()
-        # Clip gradients to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)  # Already 1.0
-        self.optimizer.step()
-        
-        # Soft update target network
-        self.soft_update()
-        
-        # Decay epsilon
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
-        
-        return loss.item()
-    
-    def save(self, path="dqn_model.pt"):
-        """Save the model"""
-        torch.save({
-            'q_net_state_dict': self.q_net.state_dict(),
-            'target_net_state_dict': self.target_net.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epsilon': self.epsilon
-        }, path)
-    
-    def load(self, path="dqn_model.pt"):
-        """Load the model"""
-        if os.path.exists(path):
-            checkpoint = torch.load(path, map_location=self.device)
-            self.q_net.load_state_dict(checkpoint['q_net_state_dict'])
-            self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            self.epsilon = checkpoint['epsilon']
-            print(f"Model loaded from {path}")
-        else:
-            print(f"No model found at {path}")
+        self.optimizer.step() 
+        self.learn_step_counter += 1
 
-# 4. Evaluation Function (Unchanged)
-def evaluate_agent(agent, eval_env, num_episodes=5):
-    """Evaluate the agent's performance"""
-    eval_rewards = []
-    
-    for episode in range(num_episodes):
-        eval_state, _ = eval_env.reset()
-        eval_episode_reward = 0
-        eval_done = False
-        eval_truncated = False
-        
-        while not eval_done and not eval_truncated:
-            eval_action = agent.act(eval_state, use_random=False)  # No exploration
-            eval_state, eval_reward, eval_done, eval_truncated, _ = eval_env.step(eval_action)
-            eval_episode_reward += eval_reward
-        
-        eval_rewards.append(eval_episode_reward)
-    
-    return sum(eval_rewards) / len(eval_rewards)
-
-# 5. Training Routine with Enhanced Logging
-def main():
-    # Create environments without HistoryWrapper
-    base_env = HIVPatient(domain_randomization=False)
-    env = TimeLimit(base_env, max_episode_steps=200)
-    
-    eval_base_env = HIVPatient(domain_randomization=False)
-    eval_env = TimeLimit(eval_base_env, max_episode_steps=200)
-    
-    # Create agent
-    agent = ProjectAgent()
-    
-    # Optionally load a pre-trained model
-    # agent.load("best_model.pt")
-    
-    # Training parameters
-    num_episodes = 300  # You can increase this number for better performance
-    eval_freq = 10
-    best_eval_reward = float('-inf')
-    
-    print("Starting training...")
-    
-    try:
-        for episode in range(num_episodes):
-            state, _ = env.reset()
-            episode_reward = 0
-            episode_loss = 0
-            episode_steps = 0
-            done = False
-            truncated = False
-            
-            while not done and not truncated:
-                # Select and perform action
-                action = agent.act(state, use_random=True)
-                next_state, reward, done, truncated, _ = env.step(action)
-                
-                # Store transition with scaled reward
-                agent.memory.push(state, action, reward, next_state, done or truncated)
-                
-                # Move to next state
+    def train(self, env, max_episode):
+        episode_return = []
+        MC_avg_total_reward = []
+        MC_avg_discounted_reward = []
+        V_init_state = []
+        episode = 0
+        episode_cum_reward = 0
+        state, _ = env.reset()
+        epsilon = self.epsilon_max
+        step = 0
+        while episode < max_episode:
+            # Update epsilon
+            if step > self.epsilon_delay:
+                epsilon = max(self.epsilon_min, epsilon - self.epsilon_step)
+            # Select epsilon-greedy action
+            if np.random.rand() < epsilon:
+                action = env.action_space.sample()
+            else:
+                action = greedy_action(self.model, state)
+            # Step
+            next_state, reward, done, trunc, _ = env.step(action)
+            self.memory.append(state, action, reward, next_state, done)
+            episode_cum_reward += reward
+            # Train
+            for _ in range(self.nb_gradient_steps): 
+                self.gradient_step()
+            # Update target network if needed
+            if self.update_target_strategy == 'replace':
+                if step % self.update_target_freq == 0: 
+                    self.target_model.load_state_dict(self.model.state_dict())
+            if self.update_target_strategy == 'ema':
+                target_state_dict = self.target_model.state_dict()
+                model_state_dict = self.model.state_dict()
+                tau = self.update_target_tau
+                for key in model_state_dict:
+                    target_state_dict[key] = tau * model_state_dict[key] + (1 - tau) * target_state_dict[key]
+                self.target_model.load_state_dict(target_state_dict)
+            # Next transition
+            step += 1
+            if done or trunc:
+                episode += 1
+                # Monitoring
+                if self.monitoring_nb_trials > 0 and episode % self.monitor_every == 0: 
+                    MC_dr, MC_tr = self.MC_eval(env, self.monitoring_nb_trials)
+                    V0 = self.V_initial_state(env, self.monitoring_nb_trials)
+                    MC_avg_total_reward.append(MC_tr)
+                    MC_avg_discounted_reward.append(MC_dr)
+                    V_init_state.append(V0)
+                    episode_return.append(episode_cum_reward)
+                    print("Episode ", '{:2d}'.format(episode), 
+                          ", epsilon ", '{:6.2f}'.format(epsilon), 
+                          ", memory size ", '{:4d}'.format(len(self.memory)), 
+                          ", ep return ={:e} ", '{:6.0f}'.format(episode_cum_reward), 
+                          ", MC tot ", '{:6.0f}'.format(MC_tr),
+                          ", MC disc ", '{:6.0f}'.format(MC_dr),
+                          ", V0 ", '{:6.0f}'.format(V0),
+                          sep='')
+                    if MC_tr > self.best_return:
+                        self.best_return = MC_tr
+                        self.save(self.save_path)
+                        print("Best return is updated to ", self.best_return)
+                else:
+                    episode_return.append(episode_cum_reward)
+                    print("Episode ", '{:2d}'.format(episode), 
+                          ", epsilon ", '{:6.2f}'.format(epsilon), 
+                          ", memory size ", '{:4d}'.format(len(self.memory)), 
+                          ", ep return ={:e}", '{:6.0f}'.format(episode_cum_reward), 
+                          sep='')
+                state, _ = env.reset()
+                episode_cum_reward = 0
+            else:
                 state = next_state
-                episode_reward += reward
-                
-                # Perform optimization step
-                loss = agent.update()
-                if loss is not None:
-                    episode_loss += loss
-                
-                episode_steps += 1
-            
-            # Calculate average loss for the episode
-            avg_loss = episode_loss / episode_steps if episode_steps > 0 else 0
-            
-            # Print episode statistics
-            print(f"\nEpisode {episode + 1}")
-            print(f"Training reward: {episode_reward:.2f}")
-            print(f"Average loss: {avg_loss:.5f}")
-            print(f"Epsilon: {agent.epsilon:.3f}")
-            
-            # Evaluate every eval_freq episodes
-            if (episode + 1) % eval_freq == 0:
-                avg_eval_reward = evaluate_agent(agent, eval_env)
-                print(f"Average evaluation reward: {avg_eval_reward:.2f}")
-                
-                # Save best model
-                if avg_eval_reward > best_eval_reward:
-                    best_eval_reward = avg_eval_reward
-                    agent.save("dqn_model.pt")
-                    print(f"New best model saved with reward: {best_eval_reward:.2f}")
+        return episode_return, MC_avg_discounted_reward, MC_avg_total_reward, V_init_state
+
+    def act(self, state):
+        return greedy_action(self.model, state)
+
+    def save(self, path):
+        torch.save(self.model.state_dict(), path)
+        print(f"Model saved to {path}")
+
+    def load(self, path):
+        self.model.load_state_dict(torch.load(path, map_location=self.device))
+        self.model.eval()
+        print(f"Model loaded from {path}")
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Set the model
+state_dim = env.observation_space.shape[0]
+nb_actions = env.action_space.n
+
+model = MLP(state_dim, 512, nb_actions, depth=5, activation=torch.nn.SiLU(), normalization=None).to(device)
+
+config = {
+    'nb_actions': nb_actions,
+    'learning_rate': 0.001,
+    'gamma': 0.98,
+    'buffer_size': 1000000,
+    'epsilon_min': 0.01,
+    'epsilon_max': 1.,
+    'epsilon_decay_period': 10000,
+    'epsilon_delay_decay': 400,
+    'batch_size': 1024,  # Reduced from 1024 to 128
+    'gradient_steps': 2,
+    'update_target_strategy': 'ema', # or 'replace'
+    'update_target_freq': 600,
+    'update_target_tau': 0.001,
+    'criterion': torch.nn.SmoothL1Loss(),
+    'monitoring_nb_trials': 50, 
+    'monitor_every': 50, 
+    'save_path': './dqn_agent.pth',
+    'save_every': 50
+}
+
+agent = DQN_Agent(config, model)
+
+class ProjectAgent:
+    def __init__(self):
+        self.dqn_agent = DQN_Agent(config, model)
     
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user")
+    def act(self, observation, use_random=False):
+        return self.dqn_agent.act(observation)
     
-    print("\nTraining complete!")
-    print(f"Best evaluation reward: {best_eval_reward:.2f}")
+    def save(self, path):
+        self.dqn_agent.save(path)
+    
+    def load(self):
+        path = os.path.join(os.getcwd(), "dqn_agent.pth")  # Corrected path
+        self.dqn_agent.load(path)
+
+def fill_buffer(env, agent, buffer_size):
+    state, _ = env.reset()
+    progress_bar = tqdm.tqdm(total=buffer_size, desc="Filling the replay buffer")
+    for _ in range(buffer_size):
+        action = agent.act(state)
+        next_state, reward, done, trunc, _ = env.step(action)
+        agent.dqn_agent.memory.append(state, action, reward, next_state, done)
+        if done or trunc:
+            state, _ = env.reset()
+        else:
+            state = next_state
+        progress_bar.update(1)
+    progress_bar.close()
 
 if __name__ == "__main__":
-    main()
-
+    # Set the seed
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # env.seed(seed)  # Uncomment if env supports it
+    
+    # Initialize ProjectAgent
+    project_agent = ProjectAgent()
+    
+    # Fill the buffer
+    fill_buffer(env, project_agent, 8000)
+    
+    # Train the agent
+    ep_length, disc_rewards, tot_rewards, V0 = project_agent.dqn_agent.train(env, 4000)
+    project_agent.save(config['save_path'])
+    print("Training done")
